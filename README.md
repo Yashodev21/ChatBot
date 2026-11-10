@@ -5,19 +5,27 @@ Add these two PDFs to `data/` with exactly these names:
 - `bharatiya-nyaya-sanhita-bns.pdf`
 - `Indian cons.pdf`
 
-The app uses ChromaDB's local default ONNX embedding model and the public
-SmolLM2-360M-Instruct Q4_K_M GGUF model. No Gemini key, Hugging Face token,
-or user API key is needed.
+The app uses BM25 keyword retrieval and the public
+Qwen2.5-1.5B-Instruct Q4_K_M GGUF model. No Gemini key, Hugging Face token,
+or user API key is needed. ChromaDB and ONNX are not used.
 
 ## Run locally (Windows PowerShell)
-    python -m venv venv
+    py -3.9 -m venv venv
     .\venv\Scripts\Activate.ps1
     python -m pip install --upgrade pip
     pip install -r requirements.txt
     streamlit run app.py
 
-If `llama-cpp-python` fails to build on Windows, install CMake and Visual
-Studio Build Tools with the C++ desktop workload, then retry.
+The application code remains compatible with Python 3.9.6. The pinned
+dependencies are selected for compatibility with both Python 3.9 and 3.11.
+The deployment environment should remain on Python 3.11 because that is the
+currently configured Streamlit Community Cloud runtime; changing it is not
+required by the application.
+
+The deployment requirements use the public CPU-wheel index for
+`llama-cpp-python`, so Streamlit Community Cloud does not need to compile it
+from source. Local Windows installation may still need a compiler if the
+selected wheel is not available for the local interpreter.
 
 ## Deploy free on Streamlit Community Cloud
 1. Push this whole project to a GitHub repository.
@@ -40,13 +48,11 @@ No Streamlit secrets are required.
 
 ## Free-hosting caveats
 Streamlit Community Cloud has limited CPU/RAM (documented maximum around
-2.7 GB for ordinary apps). The 360M Q4_K_M model is small (about 271 MB),
-but generation can still be slow and the app can exceed free resource limits.
-The small model is not dependable for complex legal reasoning. Always verify
-important answers against the official PDFs. Chroma's index is built in
-temporary storage at startup and rebuilt after a full restart. First startup
-downloads the model and local embedding model. PDFs must contain selectable
-text; scanned PDFs need OCR first.
+2.7 GB for ordinary apps). The 1.5B Q4_K_M model is larger than the former
+360M model, so generation can still be slow or exceed free resource limits.
+The model is cached by Streamlit and Hugging Face after the first successful
+download. Always verify important answers against the official PDFs. PDFs
+must contain selectable text; scanned PDFs need OCR first.
 
 If the app exceeds memory, becomes slow, or restarts, free hosting may not be
 sufficient for reliable local LLM inference. This package is a best-effort

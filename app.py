@@ -88,22 +88,30 @@ def get_file_signature():
 
 
 @st.cache_data(show_spinner=False)
-def read_pdf_pages(file_signature):
+def read_pdf_pages(_file_signature):
     # file_signature invalidates cached extraction if a PDF changes.
+    del _file_signature
     pages = []
 
     for doc_type, pdf_path in PDF_FILES.items():
         with fitz.open(pdf_path) as pdf:
+            document_pages = 0
             for page_number, page in enumerate(pdf, start=1):
                 text = normalize_text(page.get_text("text"))
 
                 if text:
+                    document_pages += 1
                     pages.append({
                         "doc_type": doc_type,
                         "document": pdf_path.name,
                         "page": page_number,
                         "text": text,
                     })
+
+            if not document_pages:
+                raise ValueError(
+                    f"No selectable text was extracted from {pdf_path.name}."
+                )
 
     if not pages:
         raise ValueError(
@@ -146,6 +154,10 @@ def tokenize(text):
         for token in TOKEN_RE.findall(text)
         if len(token) > 1
     ]
+
+
+def source_name(doc_type):
+    return "BNS" if doc_type == "bns" else "Constitution"
 
 
 class BM25Index:
@@ -236,9 +248,9 @@ def load_llm():
 
     return Llama(
         model_path=model_path,
-        n_ctx=4096,
-        n_threads=max(2, min(8, cpu_count - 1)),
-        n_batch=256,
+        n_ctx=2048,
+        n_threads=max(2, min(4, cpu_count - 1)),
+        n_batch=128,
         verbose=False,
     )
 
@@ -296,6 +308,9 @@ def find_provision_on_pages(pages, provision):
         rf"[ \t]*([A-Z][^\n]{{3,}})"
     )
 
+    next_heading_re = re.compile(
+        r"(?m)^[ \t]*\d+[ \t]*[.)—–-][ \t]+"
+    )
     matches = []
 
     for page in pages:
@@ -308,7 +323,9 @@ def find_provision_on_pages(pages, provision):
         if not match:
             continue
 
-        extracted = text[match.start():].strip()
+        next_heading = next_heading_re.search(text, match.end())
+        end = next_heading.start() if next_heading else len(text)
+        extracted = text[match.start():end].strip()
 
         if len(tokenize(extracted)) < 20:
             continue
@@ -320,7 +337,9 @@ def find_provision_on_pages(pages, provision):
             "page": page["page"],
         })
 
-    return matches
+    # Constitution schedules also contain numbered paragraphs. The first
+    # matching heading is the article in the main text.
+    return matches[:1]
 
 
 # ---------------- RETRIEVAL ----------------
@@ -345,7 +364,9 @@ def retrieve(index, pages, question):
             ]
 
             context = "\n\n".join(
-                page["text"] for page in selected_pages
+                f"[Source: {source_name(page['doc_type'])}, "
+                f"page {page['page']}]\n{page['text']}"
+                for page in selected_pages
             )
 
             return context[:MAX_CONTEXT_CHARS]
@@ -368,7 +389,10 @@ def retrieve(index, pages, question):
             continue
 
         seen.add(normalized)
-        parts.append(hit["text"])
+        parts.append(
+            f"[Source: {source_name(hit['doc_type'])}, "
+            f"page {hit['page']}]\n{hit['text']}"
+        )
 
     return "\n\n".join(parts)[:MAX_CONTEXT_CHARS]
 
@@ -391,6 +415,7 @@ Rules:
 - Do not use outside knowledge.
 - Do not invent articles, sections, definitions, punishments or cases.
 - Explain what the supplied text actually says.
+- Include the source page number when it is present in the excerpts.
 - If the excerpts are incomplete, say what is missing.
 - Do not repeat sentences, headings or bullet points.
 - Do not write generic filler such as "Important points".
@@ -439,11 +464,30 @@ Answer based only on these excerpts."""
 try:
     signature = get_file_signature()
     pages, chunks, search_index = load_search_index(signature)
-    llm = load_llm()
-
-except Exception as exc:
+except (FileNotFoundError, ValueError, fitz.FileDataError) as exc:
     print(f"Startup error: {type(exc).__name__}: {exc}")
-    st.error("The chatbot could not start. Check the terminal for details.")
+    st.error(
+        "The legal PDFs are missing, empty, unreadable, or contain no "
+        "selectable text."
+    )
+    st.stop()
+except (OSError, MemoryError) as exc:
+    print(f"Startup error: {type(exc).__name__}: {exc}")
+    st.error("The legal documents could not be loaded because of a resource limitation.")
+    st.stop()
+
+try:
+    llm = load_llm()
+except MemoryError as exc:
+    print(f"Model error: {type(exc).__name__}: {exc}")
+    st.error("The language model needs more memory than this host currently provides.")
+    st.stop()
+except Exception as exc:
+    print(f"Model error: {type(exc).__name__}: {exc}")
+    st.error(
+        "The language model could not be downloaded or loaded. "
+        "Please try again later."
+    )
     st.stop()
 
 
@@ -471,7 +515,8 @@ for message in st.session_state.messages:
 
 question = st.chat_input("Ask a question about Indian law...")
 
-if question:
+if question and question.strip():
+    question = question.strip()
     st.session_state.messages.append({
         "role": "user",
         "content": question,
