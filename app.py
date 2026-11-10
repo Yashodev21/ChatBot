@@ -1,14 +1,11 @@
 import hashlib
 import math
-import os
 import re
 from collections import Counter
 from pathlib import Path
 
 import fitz
 import streamlit as st
-from huggingface_hub import hf_hub_download
-from llama_cpp import Llama
 
 
 # ---------------- CONFIGURATION ----------------
@@ -27,22 +24,17 @@ PDF_FILES = {
     "constitution": DATA_DIR / "Indian cons.pdf",
 }
 
-# Stronger than the previous 360M model.
-# Downloads on first run; needs more RAM and disk space.
-MODEL_REPO = "bartowski/Qwen2.5-1.5B-Instruct-GGUF"
-MODEL_FILE = "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf"
-
 CHUNK_WORDS = 220
 CHUNK_OVERLAP = 40
 TOP_K = 5
 MAX_CONTEXT_CHARS = 6500
-MAX_ANSWER_TOKENS = 350
 
 
 # ---------------- PDF EXTRACTION ----------------
 
 def normalize_text(text):
     text = text.replace("\x00", " ")
+    text = text.replace("\ufffd", " ")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\r\n?", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -235,26 +227,6 @@ def load_search_index(file_signature):
     return pages, chunks, BM25Index(chunks)
 
 
-# ---------------- LOCAL LANGUAGE MODEL ----------------
-
-@st.cache_resource(show_spinner="Loading the local language model...")
-def load_llm():
-    model_path = hf_hub_download(
-        repo_id=MODEL_REPO,
-        filename=MODEL_FILE,
-    )
-
-    cpu_count = os.cpu_count() or 4
-
-    return Llama(
-        model_path=model_path,
-        n_ctx=2048,
-        n_threads=max(2, min(4, cpu_count - 1)),
-        n_batch=128,
-        verbose=False,
-    )
-
-
 # ---------------- ARTICLE / SECTION DETECTION ----------------
 
 def detect_provision(question):
@@ -363,13 +335,22 @@ def retrieve(index, pages, question):
                 )
             ]
 
-            context = "\n\n".join(
+            exact_context = [
+                f"[Source: {source_name(item['doc_type'])}, "
+                f"page {item['page']}]\n{item['text']}"
+                for item in exact
+            ]
+            exact_pages = {item["page"] for item in exact}
+            adjacent_context = [
                 f"[Source: {source_name(page['doc_type'])}, "
                 f"page {page['page']}]\n{page['text']}"
                 for page in selected_pages
-            )
+                if page["page"] not in exact_pages
+            ]
 
-            return context[:MAX_CONTEXT_CHARS]
+            return "\n\n".join(
+                exact_context + adjacent_context
+            )[:MAX_CONTEXT_CHARS]
 
         # Do not answer a specific provision using an unrelated section.
         return ""
@@ -397,9 +378,52 @@ def retrieve(index, pages, question):
     return "\n\n".join(parts)[:MAX_CONTEXT_CHARS]
 
 
-# ---------------- ANSWER GENERATION ----------------
+# ---------------- EXTRACTIVE ANSWERS ----------------
 
-def generate_answer(llm, question, context):
+SOURCE_RE = re.compile(
+    r"^\[Source: (?P<document>[^,]+), page (?P<page>\d+)\]$"
+)
+
+
+def split_source_blocks(context):
+    blocks = []
+    current_source = None
+    current_text = []
+
+    for line in context.splitlines():
+        source_match = SOURCE_RE.match(line.strip())
+
+        if source_match:
+            if current_source and current_text:
+                blocks.append((current_source, "\n".join(current_text).strip()))
+            current_source = source_match.groupdict()
+            current_text = []
+        elif current_source:
+            current_text.append(line)
+
+    if current_source and current_text:
+        blocks.append((current_source, "\n".join(current_text).strip()))
+
+    return blocks
+
+
+def split_sentences(text):
+    text = text.replace("�", " ")
+    fragments = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", text)
+        if sentence.strip()
+    ]
+    sentences = []
+    for fragment in fragments:
+        if sentences and len(sentences[-1]) < 20:
+            sentences[-1] = f"{sentences[-1]} {fragment}"
+        else:
+            sentences.append(fragment)
+    return sentences
+
+
+def extractive_answer(question, context):
     if not context.strip():
         return (
             "I couldn't find sufficient supporting text for this question "
@@ -407,56 +431,58 @@ def generate_answer(llm, question, context):
             "provision is present and text-readable."
         )
 
-    system_prompt = """You are a careful Indian legal document assistant.
-
-Answer using ONLY the supplied source excerpts.
-
-Rules:
-- Do not use outside knowledge.
-- Do not invent articles, sections, definitions, punishments or cases.
-- Explain what the supplied text actually says.
-- Include the source page number when it is present in the excerpts.
-- If the excerpts are incomplete, say what is missing.
-- Do not repeat sentences, headings or bullet points.
-- Do not write generic filler such as "Important points".
-- Use plain, simple English.
-- Keep the answer focused and concise.
-- This is general legal information, not legal advice.
-
-Write a short paragraph first. Use bullets only when the source
-contains several distinct points that need explaining."""
-
-    user_prompt = f"""SOURCE EXCERPTS:
-{context}
-
-QUESTION:
-{question}
-
-Answer based only on these excerpts."""
-
-    result = llm.create_chat_completion(
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.1,
-        top_p=0.8,
-        repeat_penalty=1.15,
-        max_tokens=MAX_ANSWER_TOKENS,
-        stream=False,
-    )
-
-    answer = (
-        result["choices"][0]["message"].get("content") or ""
-    ).strip()
-
-    if not answer:
+    blocks = split_source_blocks(context)
+    if not blocks:
         return (
-            "I couldn't generate an answer from the retrieved text. "
-            "Please try asking in a different way."
+            "I couldn't identify a citable excerpt in the retrieved text. "
+            "The available documents do not provide enough information."
         )
 
-    return answer
+    query_terms = set(tokenize(question))
+    provision = detect_provision(question)
+    if provision:
+        query_terms.add(provision["number"].lower())
+
+    candidates = []
+    for block_index, (source, text) in enumerate(blocks):
+        for sentence_index, sentence in enumerate(split_sentences(text)):
+            sentence_terms = set(tokenize(sentence))
+            overlap = len(query_terms.intersection(sentence_terms))
+            if overlap:
+                candidates.append((
+                    overlap,
+                    -block_index,
+                    -sentence_index,
+                    source,
+                    sentence,
+                ))
+
+    if not candidates:
+        return (
+            "The retrieved excerpts do not contain a reliable answer to "
+            "this question. The available documents do not provide enough "
+            "information."
+        )
+
+    candidates.sort(reverse=True)
+    selected = []
+    seen = set()
+    for _, _, _, source, sentence in candidates:
+        normalized = " ".join(sentence.lower().split())
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        selected.append((source, sentence))
+        if len(selected) == 5:
+            break
+
+    lines = ["The following is quoted from the retrieved legal text:"]
+    for source, sentence in selected:
+        lines.append(
+            f'- "{sentence}" ({source["document"]}, page {source["page"]})'
+        )
+
+    return "\n\n".join(lines)
 
 
 # ---------------- LOAD APPLICATION ----------------
@@ -473,20 +499,9 @@ except (FileNotFoundError, ValueError, fitz.FileDataError) as exc:
     st.stop()
 except (OSError, MemoryError) as exc:
     print(f"Startup error: {type(exc).__name__}: {exc}")
-    st.error("The legal documents could not be loaded because of a resource limitation.")
-    st.stop()
-
-try:
-    llm = load_llm()
-except MemoryError as exc:
-    print(f"Model error: {type(exc).__name__}: {exc}")
-    st.error("The language model needs more memory than this host currently provides.")
-    st.stop()
-except Exception as exc:
-    print(f"Model error: {type(exc).__name__}: {exc}")
     st.error(
-        "The language model could not be downloaded or loaded. "
-        "Please try again later."
+        "The legal documents could not be loaded because of a resource "
+        "limitation."
     )
     st.stop()
 
@@ -530,8 +545,7 @@ if question and question.strip():
             with st.spinner("Searching the legal documents..."):
                 context = retrieve(search_index, pages, question)
 
-            with st.spinner("Preparing your answer..."):
-                answer = generate_answer(llm, question, context)
+            answer = extractive_answer(question, context)
 
             st.markdown(answer)
 

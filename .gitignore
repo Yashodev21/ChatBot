@@ -6,11 +6,9 @@ venv/
 .venv/
 env/
 
-.chroma_db/
 .streamlit/secrets.toml
 *.sqlite3
 
-*.gguf
 *.bin
 models/
 
